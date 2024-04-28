@@ -1,0 +1,138 @@
+import asyncio
+import aiohttp
+from tqdm import tqdm
+from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor
+
+API_KEY = "376697ac82fd08878ec35c0aad1a0a86"
+USERNAME = "AveryCJ"  # Set the default username
+
+# Dictionary to store cached friends for each user
+cached_friends = {}
+
+@lru_cache(maxsize=None)
+async def get_user_followers_count(username):
+    url = f"http://ws.audioscrobbler.com/2.0/?method=user.getinfo&user={username}&api_key={API_KEY}&format=json"
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as response:
+            data = await response.json()
+            if "user" in data and "playcount" in data["user"]:
+                return int(data["user"]["playcount"])
+    return 0
+
+async def get_friends_from_api(username):
+    url = f"http://ws.audioscrobbler.com/2.0/?method=user.getfriends&user={username}&api_key={API_KEY}&format=json"
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as response:
+            data = await response.json()
+
+    friends = []
+
+    if "friends" in data and "user" in data["friends"]:
+        total_friends = int(data["friends"]["@attr"]["total"])
+
+        # Fetch all pages of friends
+        tasks = []
+        for page in range(1, total_friends // 50 + 2):  # 50 friends per page
+            url = f"http://ws.audioscrobbler.com/2.0/?method=user.getfriends&user={username}&api_key={API_KEY}&format=json&page={page}"
+            task = asyncio.create_task(fetch_data(url))
+            tasks.append(task)
+
+        friends_data = await asyncio.gather(*tasks)
+
+        for data in friends_data:
+            try:
+                friends += [friend["name"] for friend in data["friends"]["user"]]
+            except KeyError:
+                # Handle the case where the key 'friends' or 'user' is not present in the API response
+                pass
+
+    return friends
+
+async def fetch_data(url):
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as response:
+            return await response.json()
+
+async def get_user_friends(username):
+    global cached_friends
+    if username in cached_friends:
+        return cached_friends[username]
+
+    friends = await get_friends_from_api(username)
+    cached_friends[username] = friends
+    return friends
+
+async def find_shortest_path(username, artist):
+    visited = {username: None}
+    queue = [username]
+
+    while queue:
+        current_user = queue.pop(0)
+        friends = await get_user_friends(current_user)
+
+        with tqdm(friends, desc=f"Scanning {current_user}'s Friends") as pbar:
+            for friend in pbar:
+                if friend not in visited:
+                    queue.append(friend)
+                    visited[friend] = current_user
+
+                    with tqdm(total=1, desc=f"Scanning {friend} for {artist}", leave=False) as sub_pbar:
+                        if await check_friend_scrobbles(current_user, friend, artist):
+                            return build_path(visited, friend)
+                        sub_pbar.update(1)
+
+    return None
+
+def build_path(visited, friend):
+    path = []
+    while friend:
+        path.append(friend)
+        friend = visited[friend]
+    path.reverse()
+    return path
+
+@lru_cache(maxsize=None)
+async def get_recently_scrobbled_artist(username):
+    url = f"http://ws.audioscrobbler.com/2.0/?method=user.getrecenttracks&user={username}&api_key={API_KEY}&format=json&limit=1"
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as response:
+            data = await response.json()
+            try:
+                artist = data["recenttracks"]["track"][0]["artist"]["#text"]
+                return artist
+            except (KeyError, IndexError):
+                return None
+
+async def check_friend_scrobbles(username, friend, target_artist):
+    url = f"http://ws.audioscrobbler.com/2.0/?method=user.gettopartists&user={friend}&api_key={API_KEY}&format=json"
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as response:
+            data = await response.json()
+            try:
+                artists = data["topartists"]["artist"]
+                return any(artist["name"].lower() == target_artist.lower() for artist in artists)
+            except KeyError:
+                return False
+
+async def main():
+    artist = await get_recently_scrobbled_artist(USERNAME)
+
+    if artist:
+        friends = await get_user_friends(USERNAME)
+        print("List of Friends:")
+        print(friends)
+        print()
+
+        path = await find_shortest_path(USERNAME, artist)
+
+        if path:
+            print("Shortest path to", artist, ":")
+            print(" -> ".join(path))
+        else:
+            print("No path found to", artist)
+    else:
+        print("No currently scrobbled artist found.")
+
+if __name__ == "__main__":
+    asyncio.run(main())
